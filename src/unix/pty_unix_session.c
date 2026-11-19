@@ -528,11 +528,15 @@ static void *reactor_worker(void *argument)
         }
         pthread_mutex_lock(&platform->mutex);
         const int stopping_after_wake = platform->stopping;
+        // An ack that ends exhausted credit wakes the reactor only once, so
+        // the drain below must see that credit, not the snapshot from before.
+        const int can_read_after_wake =
+            platform->discard_output || session->output_credit > 0;
         pthread_mutex_unlock(&platform->mutex);
         if (stopping_after_wake) break;
         if (wake_ready && atomic_load_explicit(&session->process_exited,
                                                memory_order_acquire) &&
-            (discard || credit > 0)) {
+            can_read_after_wake) {
             while (true) {
                 const int read_result = read_output(session);
                 if (read_result == PTY_READ_DATA) continue;
