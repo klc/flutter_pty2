@@ -360,6 +360,27 @@ void main() {
     );
   }, skip: skipReason);
 
+  test('closes while paused output fills the ConPTY pipe', () async {
+    final child = fixture;
+    if (child == null) return;
+    final session = await Pty.spawn(
+      PtySpawnOptions(
+        executable: child,
+        arguments: const ['flood-output', '100000000'],
+        outputWindowBytes: 16 * 1024,
+      ),
+    );
+    final subscription = session.output.listen((_) {});
+    subscription.pause();
+    // Let the window and the output pipe fill while nothing reads.
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    try {
+      await session.close().timeout(const Duration(seconds: 10));
+    } finally {
+      await subscription.cancel();
+    }
+  }, skip: skipReason);
+
   test('kills a ConPTY while output is active', () async {
     final child = fixture;
     if (child == null) return;
