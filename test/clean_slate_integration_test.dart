@@ -740,6 +740,35 @@ void main() {
     timeout: const Timeout(Duration(minutes: 2)),
   );
 
+  test('delivers a burst from a live child without waiting for more', () async {
+    final child = fixture;
+    if (child == null) return;
+    const burst = 4096;
+    final session = await Pty.spawn(
+      PtySpawnOptions(
+        executable: child,
+        arguments: const ['slow-copy-input', '${2 * burst}', '0'],
+      ),
+    );
+    final binaryOutput = await _listenForBinaryOutput(session);
+    try {
+      await session.input.write(Uint8List(burst));
+      // The child now waits for the second burst, so nothing else arrives.
+      final stopwatch = Stopwatch()..start();
+      while (binaryOutput.bytes.length < burst) {
+        expect(stopwatch.elapsed, lessThan(const Duration(seconds: 1)));
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+
+      await session.input.write(Uint8List(burst));
+      await session.done.timeout(const Duration(seconds: 30));
+      expect(binaryOutput.bytes.length, 2 * burst);
+    } finally {
+      await binaryOutput.subscription.cancel();
+      await session.close();
+    }
+  }, skip: skipReason);
+
   test('completes writes while the child reads slowly', () async {
     final child = fixture;
     if (child == null) return;

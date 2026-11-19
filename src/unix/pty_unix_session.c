@@ -12,13 +12,23 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../common/pty_error.h"
 #include "../common/pty_event.h"
 #include "../pty_internal.h"
 
-#define PTY_REACTOR_BUFFER_SIZE (16 * 1024)
+#define PTY_REACTOR_BUFFER_SIZE (64 * 1024)
+/*
+ * A read that returns at least this much output may be followed by more, so
+ * the reactor waits briefly for it instead of posting one event per read
+ * (macOS returns at most 1 KiB per read). Smaller output, such as an echoed
+ * keystroke, is posted at once.
+ */
+#define PTY_COALESCE_MIN_BYTES 1024
+/* How long after the first byte the reactor may hold output back. */
+#define PTY_COALESCE_BUDGET_NS (2 * 1000 * 1000)
 #define PTY_WAKE_BUFFER_SIZE 64
 
 typedef enum PtyReadResult {
@@ -63,6 +73,7 @@ typedef struct PtyUnixPlatform {
     int stopping;
     int write_backpressured;
     int discard_output;
+    int output_held;
     int output_hung_up;
     int output_closed;
     int input_closed;
@@ -319,7 +330,52 @@ static int pty_unix_flush_write_queue(PtySession *session)
     }
 }
 
-static int read_output(PtySession *session)
+static int64_t monotonic_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+}
+
+/*
+ * Waits until the deadline for more output. Returns 1 when output is ready;
+ * 0 on timeout, hang-up, a pending wake, or queued input, which the reactor
+ * loop handles. Queued input must not wait: the child may be waiting for it.
+ */
+static int wait_for_more_output(PtyUnixPlatform *platform,
+                                int master_fd,
+                                int64_t deadline)
+{
+    pthread_mutex_lock(&platform->mutex);
+    const int has_writes =
+        pty_write_queue_queued_bytes(&platform->write_queue) != 0;
+    pthread_mutex_unlock(&platform->mutex);
+    if (has_writes) return 0;
+    const int64_t remaining = deadline - monotonic_ns();
+    if (remaining <= 0) return 0;
+    struct pollfd descriptors[2] = {
+        {.fd = master_fd, .events = POLLIN},
+        {.fd = platform->wake_pipe[0], .events = POLLIN},
+    };
+    // Rounded down so the whole hold stays within the budget.
+    const int timeout_ms = (int)(remaining / 1000000);
+    if (poll(descriptors, 2, timeout_ms) <= 0) return 0;
+    if ((descriptors[1].revents & POLLIN) != 0) return 0;
+    return (descriptors[0].revents & POLLIN) != 0;
+}
+
+/*
+ * Marks output as held back before the reactor checks for exit, so the
+ * waiter either sees the mark or the reactor sees the exit and posts at once.
+ */
+static void hold_output(PtyUnixPlatform *platform, int held)
+{
+    pthread_mutex_lock(&platform->mutex);
+    platform->output_held = held;
+    pthread_mutex_unlock(&platform->mutex);
+}
+
+static int read_output_into(PtySession *session, int *held)
 {
     PtyUnixPlatform *platform = platform_for(session);
     if (platform == NULL) return 0;
@@ -344,9 +400,35 @@ static int read_output(PtySession *session)
     if (capacity == 0) return PTY_READ_CREDIT_EXHAUSTED;
 
     ssize_t result;
-    do {
-        result = read(master_fd, buffer, capacity);
-    } while (result < 0 && errno == EINTR);
+    size_t filled = 0;
+    int64_t deadline = 0;
+    while (true) {
+        do {
+            result = read(master_fd, buffer + filled, capacity - filled);
+        } while (result < 0 && errno == EINTR);
+        if (result > 0) {
+            if (filled == 0) deadline = monotonic_ns() + PTY_COALESCE_BUDGET_NS;
+            filled += (size_t)result;
+            if (filled >= PTY_COALESCE_MIN_BYTES && filled < capacity) continue;
+            break;
+        }
+        // Report the first read's outcome; after output, post what was read.
+        if (filled == 0) break;
+        if (discard || filled < PTY_COALESCE_MIN_BYTES || result >= 0 ||
+            (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            break;
+        }
+        if (!*held) {
+            hold_output(platform, 1);
+            *held = 1;
+        }
+        if (atomic_load_explicit(&session->process_exited,
+                                 memory_order_acquire) ||
+            !wait_for_more_output(platform, master_fd, deadline)) {
+            break;
+        }
+    }
+    if (filled > 0) result = (ssize_t)filled;
     if (result > 0) {
         if (!discard) {
             pthread_mutex_lock(&platform->mutex);
@@ -379,6 +461,32 @@ static int read_output(PtySession *session)
         post_child_error(session, PTY_ERROR_IO, errno, "reading PTY output failed");
     }
     return PTY_READ_CLOSED;
+}
+
+static int read_output(PtySession *session)
+{
+    int held = 0;
+    const int result = read_output_into(session, &held);
+    if (held) hold_output(platform_for(session), 0);
+    return result;
+}
+
+/*
+ * Lets the reactor post output it holds back before the exit is reported,
+ * as it would have without coalescing. Bounded in case the reactor is gone.
+ * ponytail: polls a flag; a condition variable if exits ever become hot.
+ */
+static void wait_for_held_output(PtyUnixPlatform *platform)
+{
+    const int64_t deadline = monotonic_ns() + 2 * PTY_COALESCE_BUDGET_NS;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 100 * 1000};
+    while (monotonic_ns() < deadline) {
+        pthread_mutex_lock(&platform->mutex);
+        const int held = platform->output_held;
+        pthread_mutex_unlock(&platform->mutex);
+        if (!held) return;
+        nanosleep(&pause, NULL);
+    }
 }
 
 static void *reactor_worker(void *argument)
@@ -522,6 +630,7 @@ static void *waiter_worker(void *argument)
     // let the supervisor reap the program.
     release_process(platform);
     wake_reactor(platform);
+    wait_for_held_output(platform);
     if (read_result == 1) {
         post_session_event(
             session,
