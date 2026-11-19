@@ -1163,7 +1163,10 @@ FFI_PLUGIN_EXPORT int32_t pty_session_resize(PtySession *session,
     const LONG lifecycle = InterlockedCompareExchange(&session->lifecycle,
                                                       0,
                                                       0);
-    if (platform->stopping || lifecycle >= PTY_LIFECYCLE_CLOSING) {
+    // After the process exits the HPCON is released or being closed, and a
+    // closed one is freed memory.
+    if (platform->stopping || lifecycle >= PTY_LIFECYCLE_CLOSING ||
+        platform->pseudo_console_state != PTY_PSEUDO_CONSOLE_OWNED) {
         LeaveCriticalSection(&platform->mutex);
         pty_error_set(out_error,
                       PTY_ERROR_DOMAIN_INTERNAL,
