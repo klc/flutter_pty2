@@ -877,6 +877,8 @@ void main() {
     );
     expect(exit, isA<PtySignalExit>());
     if (exit case PtySignalExit(:final signal)) expect(signal, 9);
+    // A terminal may still resize a tab whose process has exited.
+    session.resize(const PtySize(columns: 80, rows: 24));
 
     final firstClose = session.close();
     final secondClose = session.close();

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
@@ -310,10 +311,10 @@ final class FfiPtySession implements PtySession, Finalizable {
       final error = arena<native.PtyError>();
       final result = bindings.pty_session_resize(handle, nativeSize.ref, error);
       if (result == 0) {
-        throw PtyIoException(
-          'Resizing PTY failed',
-          nativeError: readNativeError(error.ref),
-        );
+        final nativeError = readNativeError(error.ref);
+        // The process has exited; like kill, resizing it is a no-op.
+        if (nativeError.kind == PtyErrorKind.closed) return;
+        throw PtyIoException('Resizing PTY failed', nativeError: nativeError);
       }
     });
   }
@@ -390,11 +391,12 @@ final class FfiPtySession implements PtySession, Finalizable {
 }
 
 PtyNativeError readNativeError(native.PtyError error) {
-  final codeUnits = <int>[];
+  // UTF-8 bytes, which read negative where char is signed.
+  final bytes = <int>[];
   for (var index = 0; index < 256; index++) {
     final value = error.message[index];
     if (value == 0) break;
-    codeUnits.add(value);
+    bytes.add(value & 0xff);
   }
   final domain = _enumValue(PtyErrorDomain.values, error.domain);
   final kind = _enumValue(PtyErrorKind.values, error.kind);
@@ -402,7 +404,7 @@ PtyNativeError readNativeError(native.PtyError error) {
     domain: domain,
     kind: kind,
     code: error.os_code,
-    message: String.fromCharCodes(codeUnits),
+    message: utf8.decode(bytes, allowMalformed: true),
   );
 }
 
