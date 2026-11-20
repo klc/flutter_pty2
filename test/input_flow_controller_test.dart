@@ -33,6 +33,31 @@ void main() {
     await write;
   });
 
+  test(
+    'admits a write once tryWrite bytes that filled the window complete',
+    () async {
+      final requests = <int>[];
+      final input = InputFlowController(
+        maxChunkSize: 2,
+        maxPendingBytes: 4,
+        nativeTryWrite: (requestId, _) {
+          requests.add(requestId);
+          return PtyWriteResult.accepted;
+        },
+      );
+      expect(input.tryWrite(Uint8List(2)), PtyWriteResult.accepted);
+      expect(input.tryWrite(Uint8List(2)), PtyWriteResult.accepted);
+
+      final write = input.write(Uint8List(1));
+      expect(requests, [1, 2]);
+      input.handleWriteComplete(1);
+      input.handleWriteComplete(2);
+      expect(requests, [1, 2, 3]);
+      input.handleWriteComplete(3);
+      await write;
+    },
+  );
+
   test('flush waits only for writes submitted before it', () async {
     final requests = <int>[];
     final input = InputFlowController(

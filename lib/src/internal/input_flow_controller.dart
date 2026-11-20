@@ -121,6 +121,7 @@ final class InputFlowController implements PtyInput {
     if (_closed) return;
     _waitingForWritable = false;
     _pump();
+    _pumpAdmissions();
     _releaseOwnerIfIdle();
   }
 
@@ -142,10 +143,11 @@ final class InputFlowController implements PtyInput {
           if (!request.completer.isCompleted) {
             request.completer.complete();
           }
-          _pumpAdmissions();
         }
     }
     _pump();
+    // Completed bytes, including tryWrite ones, may open room for a write.
+    _pumpAdmissions();
     _releaseOwnerIfIdle();
   }
 
