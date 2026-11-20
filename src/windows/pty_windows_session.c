@@ -614,6 +614,31 @@ static void windows_stop_process(PtyWindowsPlatform *platform)
     if (writer_thread != NULL) CancelSynchronousIo(writer_thread);
 }
 
+/*
+ * Stops the reader and closes the output pipe. Call after
+ * windows_stop_process and before closing the pseudo console: before Windows
+ * 11 24H2 ClosePseudoConsole waits forever while conhost is blocked writing
+ * to a full output pipe nobody reads. Cancelling repeats because a cancel
+ * that lands before the reader enters ReadFile has nothing to cancel.
+ */
+static void windows_stop_reader_and_close_output(PtyWindowsPlatform *platform)
+{
+    EnterCriticalSection(&platform->mutex);
+    HANDLE reader_thread = platform->reader_started ? platform->reader_thread
+                                                    : NULL;
+    LeaveCriticalSection(&platform->mutex);
+    if (reader_thread != NULL) {
+        while (WaitForSingleObject(reader_thread, 50) == WAIT_TIMEOUT) {
+            CancelSynchronousIo(reader_thread);
+        }
+    }
+    EnterCriticalSection(&platform->mutex);
+    HANDLE output_read = platform->output_read;
+    platform->output_read = NULL;
+    LeaveCriticalSection(&platform->mutex);
+    if (output_read != NULL) CloseHandle(output_read);
+}
+
 static void windows_post_startup_cancelled(PtySession *session)
 {
     PtyError error;
@@ -635,6 +660,7 @@ static void windows_finish_unstarted_close(PtySession *session,
     windows_stop_process(platform);
     WaitForSingleObject(platform->process, INFINITE);
     if (process_thread != NULL) CloseHandle(process_thread);
+    windows_stop_reader_and_close_output(platform);
     windows_start_pseudo_console_close_worker(session);
     windows_wait_for_pseudo_console_close(session);
 
@@ -677,9 +703,7 @@ static void windows_finish_worker_startup_failure(PtySession *session,
         ResumeThread(process_thread);
         CloseHandle(process_thread);
     }
-    if (platform->reader_started) {
-        WaitForSingleObject(platform->reader_thread, INFINITE);
-    }
+    windows_stop_reader_and_close_output(platform);
     if (platform->writer_started) {
         WaitForSingleObject(platform->writer_thread, INFINITE);
     }
@@ -708,6 +732,7 @@ static DWORD WINAPI windows_close_worker(void *argument)
     PtySession *session = argument;
     PtyWindowsPlatform *platform = windows_platform(session);
     windows_stop_process(platform);
+    windows_stop_reader_and_close_output(platform);
     windows_start_pseudo_console_close_worker(session);
     windows_wait_for_pseudo_console_close(session);
     EnterCriticalSection(&platform->mutex);
