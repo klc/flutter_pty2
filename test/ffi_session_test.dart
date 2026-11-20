@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:ffi/ffi.dart';
 import 'package:flutter_pty2/src/generated/flutter_pty_bindings_generated.dart'
     as native;
 import 'package:flutter_pty2/src/internal/ffi_session.dart';
@@ -13,6 +15,25 @@ import 'package:flutter_pty2/src/pty_input.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('decodes a UTF-8 native error message', () {
+    const message = 'execve: Böyle bir dosya ya da dizin yok';
+    final error = calloc<native.PtyError>();
+    try {
+      error.ref
+        ..domain = 1
+        ..kind = 6
+        ..os_code = 2;
+      final bytes = utf8.encode(message);
+      for (var index = 0; index < bytes.length; index++) {
+        // Char is signed on most targets, so bytes above 0x7f read negative.
+        error.ref.message[index] = bytes[index].toSigned(8);
+      }
+      expect(readNativeError(error.ref).message, message);
+    } finally {
+      calloc.free(error);
+    }
+  });
+
   test('fails lifecycle futures on an early spawn failure', () async {
     var closeCalls = 0;
     final state = FfiPtySessionState(
