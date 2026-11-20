@@ -246,6 +246,16 @@ int main(void)
     EnterCriticalSection(&events.mutex);
     assert(events.session_closed == 0);
     LeaveCriticalSection(&events.mutex);
+    // Once the process exits the ConPTY is released or closed, and resizing
+    // it must be refused rather than touch a freed HPCON.
+    const PtySize exited_size = {.rows = 30, .columns = 100};
+    PtyError exited_resize_error;
+    const DWORD resize_deadline = GetTickCount() + 5000;
+    while (pty_session_resize(session, exited_size, &exited_resize_error)) {
+        assert(GetTickCount() < resize_deadline);
+        Sleep(10);
+    }
+    assert(exited_resize_error.kind == PTY_ERROR_CLOSED);
     PtyError signal_error;
     assert(pty_session_send_signal(session, 15, 0, &signal_error) == 0);
     assert(signal_error.kind == PTY_ERROR_UNSUPPORTED);
