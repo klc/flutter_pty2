@@ -740,6 +740,64 @@ void main() {
     timeout: const Timeout(Duration(minutes: 2)),
   );
 
+  test('completes when the child exits with output credit exhausted', () async {
+    final child = fixture;
+    if (child == null) return;
+    // The child fills the window exactly and exits while output is paused,
+    // so only the acks after resume can let the reactor finish.
+    const window = 64 * 1024;
+    final session = await Pty.spawn(
+      PtySpawnOptions(
+        executable: child,
+        arguments: const ['flood-output', '$window'],
+        outputWindowBytes: window,
+      ),
+    );
+    var received = 0;
+    final subscription = session.output.listen((chunk) {
+      received += chunk.length;
+    });
+    subscription.pause();
+    try {
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      subscription.resume();
+      await session.done.timeout(const Duration(seconds: 5));
+      expect(received, greaterThanOrEqualTo(window));
+    } finally {
+      await subscription.cancel();
+      await session.close();
+    }
+  }, skip: skipReason);
+
+  test('delivers a burst from a live child without waiting for more', () async {
+    final child = fixture;
+    if (child == null) return;
+    const burst = 4096;
+    final session = await Pty.spawn(
+      PtySpawnOptions(
+        executable: child,
+        arguments: const ['slow-copy-input', '${2 * burst}', '0'],
+      ),
+    );
+    final binaryOutput = await _listenForBinaryOutput(session);
+    try {
+      await session.input.write(Uint8List(burst));
+      // The child now waits for the second burst, so nothing else arrives.
+      final stopwatch = Stopwatch()..start();
+      while (binaryOutput.bytes.length < burst) {
+        expect(stopwatch.elapsed, lessThan(const Duration(seconds: 1)));
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+
+      await session.input.write(Uint8List(burst));
+      await session.done.timeout(const Duration(seconds: 30));
+      expect(binaryOutput.bytes.length, 2 * burst);
+    } finally {
+      await binaryOutput.subscription.cancel();
+      await session.close();
+    }
+  }, skip: skipReason);
+
   test('completes writes while the child reads slowly', () async {
     final child = fixture;
     if (child == null) return;
