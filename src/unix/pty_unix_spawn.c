@@ -27,7 +27,10 @@
 #endif
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
 #include <libproc.h>
+#endif
 #include <util.h>
 #elif defined(__ANDROID__)
 #include <fcntl.h>
@@ -468,7 +471,7 @@ typedef struct {
 static PtyFdList fd_list_prepare(void)
 {
     PtyFdList list = {NULL, 0};
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_OSX
     const int needed = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, NULL, 0);
     if (needed <= 0) return list;
     // Leave room for descriptors other threads open before the fork.
@@ -490,7 +493,7 @@ static int close_listed_fds_except(PtyFdList list,
                                    const int *keep,
                                    int keep_count)
 {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_OSX
     if (list.buffer == NULL) return 0;
     const int filled = proc_pidinfo(getpid(),
                                     PROC_PIDLISTFDS,
