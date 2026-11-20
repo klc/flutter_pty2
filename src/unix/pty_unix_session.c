@@ -70,6 +70,7 @@ typedef struct PtyUnixPlatform {
     int waiter_done;
     int close_started;
     int close_done;
+    int bootstrap_done;
     int stopping;
     int write_backpressured;
     int discard_output;
@@ -180,8 +181,10 @@ static void maybe_post_session_closed(PtySession *session)
     if (platform == NULL) return;
     int should_post = 0;
     pthread_mutex_lock(&platform->mutex);
+    // Bootstrap may still post SPAWNED or SPAWN_FAILED; nothing may follow
+    // SESSION_CLOSED, after which Dart drops its reference and its port.
     if (platform->stopping && platform->reactor_done && platform->waiter_done &&
-        platform->close_done &&
+        platform->close_done && platform->bootstrap_done &&
         !platform->session_closed_posted) {
         platform->session_closed_posted = 1;
         should_post = 1;
@@ -748,6 +751,15 @@ static void finish_unstarted_close(PtySession *session)
         pty_post_simple_event(session->event_port, PTY_EVENT_SESSION_CLOSED));
 }
 
+static void finish_bootstrap(PtySession *session)
+{
+    PtyUnixPlatform *platform = platform_for(session);
+    pthread_mutex_lock(&platform->mutex);
+    platform->bootstrap_done = 1;
+    pthread_mutex_unlock(&platform->mutex);
+    maybe_post_session_closed(session);
+}
+
 static void *close_worker(void *argument)
 {
     PtySession *session = argument;
@@ -922,7 +934,7 @@ static void *bootstrap_worker(void *argument)
                 pty_post_simple_event(session->event_port,
                                       PTY_EVENT_SESSION_CLOSED));
         } else {
-            maybe_post_session_closed(session);
+            finish_bootstrap(session);
         }
         pty_unix_free_options(&bootstrap->options);
         free(bootstrap);
@@ -956,7 +968,7 @@ static void *bootstrap_worker(void *argument)
         pty_session_mark_closing(session);
         post_session_event(session,
                            pty_post_spawn_failed(session->event_port, &error));
-        maybe_post_session_closed(session);
+        finish_bootstrap(session);
         pty_unix_free_options(&bootstrap->options);
         free(bootstrap);
         pty_session_release(session);
@@ -981,7 +993,7 @@ static void *bootstrap_worker(void *argument)
         stop_process(session);
         wake_reactor(platform);
         post_startup_cancelled(session);
-        maybe_post_session_closed(session);
+        finish_bootstrap(session);
         pty_unix_free_options(&bootstrap->options);
         free(bootstrap);
         pty_session_release(session);
@@ -995,6 +1007,7 @@ static void *bootstrap_worker(void *argument)
             PTY_CAPABILITY_POSIX_SIGNALS |
                 PTY_CAPABILITY_FOREGROUND_PROCESS_GROUPS |
                 PTY_CAPABILITY_PIXEL_DIMENSIONS));
+    finish_bootstrap(session);
     pty_unix_free_options(&bootstrap->options);
     free(bootstrap);
     pty_session_release(session);
